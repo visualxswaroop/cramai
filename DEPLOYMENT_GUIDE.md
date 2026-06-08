@@ -1,190 +1,196 @@
 # CRAM.ai Deployment Guide
 
-This guide covers deploying both the FastAPI backend and React frontend to production environments.
+Complete guide for deploying CRAM.ai (Retrieval-Augmented Generation academic assistant) to production. Works for any deployment platform—Railway, Vercel, Render, AWS, or self-hosted servers.
 
-## Deployment Architecture Overview
+**Target Audience**: Developers, DevOps engineers, or anyone deploying CRAM.ai
 
-```
-┌─────────────────────┐
-│   Frontend (React)  │ → Netlify / Vercel / GitHub Pages
-│   Static Build      │
-└─────────────────────┘
-         ↓ (HTTPS API calls)
-┌─────────────────────┐
-│  Backend (FastAPI)  │ → Railway / Render / Heroku / AWS
-│  + ChromaDB         │
-│  + SQLite           │
-└─────────────────────┘
-```
+**Estimated Time**: 30-45 minutes (end-to-end)
+
+## What is CRAM.ai?
+
+CRAM.ai is an AI-powered academic assistant that:
+- Ingests PDF study materials and stores them by subject/resource type
+- Uses semantic chunking and vector embeddings for intelligent retrieval
+- Generates AI answers via LLM (Google Gemini) with source citations
+- Provides a chat-based interface with real-time updates
+
+**Use case**: Students upload notes/past papers → CRAM.ai answers subject-specific questions with sources
+
+**Architecture**:
+- Backend: FastAPI + ChromaDB + SQLite
+- Frontend: React + Vite
+- LLM: Google Gemini 2.5 Flash
+- Embeddings: Sentence Transformers (all-MiniLM-L6-v2)
+
 
 ---
 
-## Option 1: Vercel (Recommended - Easiest)
+## Option 1: Vercel (Frontend) + Railway (Backend) — Recommended
 
-### Frontend Deployment
+### Frontend Deployment (Vercel)
 
-1. **Push to GitHub** (already done ✅)
-   ```bash
-   git remote -v  # Verify: https://github.com/visualxswaroop/cramai.git
-   ```
+1. **Prerequisites**
+   - GitHub account with CRAM.ai repository cloned/forked
+   - Vercel account (sign up at https://vercel.com)
 
-2. **Deploy Frontend on Vercel**
-   - Go to https://vercel.com
-   - Click "Add New Project"
-   - Import repository: `visualxswaroop/cramai`
-   - Framework: `Vite`
+2. **Deploy on Vercel**
+   - Visit https://vercel.com → New Project
+   - Import repository (select `cramai` or your fork)
+   - Framework preset: `Vite`
    - Build command: `npm run build`
    - Output directory: `dist`
-   - Environment variables: `VITE_API_URL=https://your-backend-url`
-   - Click Deploy
+   - Root directory: `frontend`
+   - Add environment variable:
+     ```
+     VITE_API_URL=<BACKEND_URL>  # Set after backend is deployed
+     ```
+   - Click Deploy → Get live URL (e.g., `https://cramai.vercel.app`)
 
-3. **Update Frontend API URL** (frontend/src/App.jsx)
+3. **Update Code (frontend/src/App.jsx)**
    ```javascript
    const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
    ```
 
-### Backend Deployment (use Railway or Render)
+### Backend Deployment (Railway)
 
----
+1. **Prerequisites**
+   - Railway account (sign up at https://railway.app)
+   - GitHub repository connected
 
-## Option 2: Railway (Recommended - Best for Python)
-
-### Backend Deployment
-
-1. **Create Railway Account**
-   - Go to https://railway.app
-   - Sign up with GitHub
-
-2. **Deploy Backend**
-   - Click "New Project"
+2. **Deploy on Railway**
+   - Visit https://railway.app → New Project
    - Select "Deploy from GitHub repo"
-   - Choose `visualxswaroop/cramai`
+   - Choose your CRAM.ai repository
    - Railway auto-detects Python
+   - Configure environment variables:
+     ```
+     GOOGLE_API_KEY=<YOUR_GOOGLE_GEMINI_API_KEY>
+     PORT=8000
+     HOST=0.0.0.0
+     ```
+   - Wait for build to complete → Copy public URL (e.g., `https://cramai-prod.railway.app`)
 
-3. **Configure Environment Variables**
-   - Add `GOOGLE_API_KEY=your_gemini_api_key`
-   - Add `DATABASE_URL=sqlite:///chat_history.db` (default)
-   - Add `PORT=8000`
+3. **Update Frontend**
+   - Go back to Vercel project settings
+   - Update environment variable:
+     ```
+     VITE_API_URL=https://cramai-prod.railway.app
+     ```
+   - Trigger redeploy
 
-4. **Setup Start Command**
-   In `CRAM ai/Procfile`:
+4. **Add Procfile** (required for Railway)
+   Create `CRAM ai/Procfile`:
    ```
    web: uvicorn main:app --host 0.0.0.0 --port $PORT
    ```
 
-5. **Get Backend URL**
-   - Railway provides a public URL like: `https://cramai-production.railway.app`
-
-### Frontend Update (Vercel)
-
-After backend is deployed on Railway:
-1. Go to Vercel project settings
-2. Add environment variable:
-   ```
-   VITE_API_URL=https://cramai-production.railway.app
-   ```
-3. Redeploy
-
 ### Database Persistence
 
-ChromaDB and SQLite will work locally on Railway, but data is lost on container restart. For production:
+By default, ChromaDB and SQLite store data locally. On container restarts, data is lost.
 
-**Option A: Use Railway Postgres** (Better)
+**Option A: Use Railway PostgreSQL Plugin** (Recommended)
 ```bash
-# Add PostgreSQL plugin in Railway
-# Update backend to use PostgreSQL instead of SQLite
+# In Railway Dashboard: Add PostgreSQL plugin
+# Then update backend to use PostgreSQL
 ```
 
 **Option B: Attach Persistent Volume**
-- In Railway, add a volume mount at `/app/data`
-- Modify `CRAM ai/main.py`:
+- In Railway: Add volume at `/app/data`
+- Update `CRAM ai/main.py`:
 ```python
-chroma_client = chromadb.PersistentClient(path="/app/data/chroma_store")
+import os
+chroma_path = os.getenv("CHROMA_PATH", "/app/data/chroma_store")
+chroma_client = chromadb.PersistentClient(path=chroma_path)
 ```
 
 ---
 
-## Option 3: Render.com (Alternative)
+## Option 2: Render (Alternative for Backend)
+
+Render is an easy alternative to Railway for backend deployment.
 
 ### Backend Deployment
 
-1. Go to https://render.com
-2. Click "New Web Service"
-3. Connect GitHub repo
-4. Configuration:
-   - **Build command**: `pip install -r CRAM\ ai/requirements.txt`
-   - **Start command**: `cd CRAM\ ai && uvicorn main:app --host 0.0.0.0`
-   - **Instance type**: Free tier available
-   - **Environment variables**: Add `GOOGLE_API_KEY`
+1. **Create Account**
+   - Sign up at https://render.com
+   - Connect GitHub account
 
-### Cost
+2. **Create Web Service**
+   - New Web Service → Select CRAM.ai repository
+   - Configuration:
+     ```
+     Build command: pip install -r CRAM\ ai/requirements.txt
+     Start command: cd CRAM\ ai && uvicorn main:app --host 0.0.0.0 --port $PORT
+     Environment: Python 3.9+
+     ```
+   - Add environment variables:
+     ```
+     GOOGLE_API_KEY=<YOUR_API_KEY>
+     PORT=8000
+     ```
+   - Select plan (Free tier available; spins down after 15 min inactivity)
 
-- **Free tier**: Spins down after 15 min inactivity (cold starts ~30 sec)
-- **Paid**: $7/month for always-on
+3. **Get Backend URL**
+   - Render provides public URL (e.g., `https://cramai-backend.onrender.com`)
+   - Use this in frontend `VITE_API_URL`
 
 ---
 
-## Step-by-Step: Quick Railway Deployment
+## Step-by-Step Quick Start (Railway + Vercel)
 
-### 1. Backend Setup
+### Phase 1: Prepare Repository
 
-In `CRAM ai/Procfile`:
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
-```
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/visualxswaroop/cramai.git
+   cd CRAM-ai
+   ```
 
-In `CRAM ai/requirements.txt`, ensure latest versions:
-```
-fastapi==0.135.2
-uvicorn==0.42.0
-python-multipart==0.0.6
-google-generativeai==0.7.2
-chromadb==0.4.24
-sentence-transformers==2.7.0
-PyMuPDF==1.27.2.3
-python-dotenv==1.0.0
-```
+2. **Create Procfile** (required for Railway)
+   ```bash
+   echo "web: uvicorn main:app --host 0.0.0.0 --port \$PORT" > "CRAM ai/Procfile"
+   git add "CRAM ai/Procfile"
+   git commit -m "Add Procfile for Railway deployment"
+   git push
+   ```
 
-### 2. Deploy Backend to Railway
+3. **Verify requirements.txt** in `CRAM ai/`:
+   ```
+   fastapi==0.135.2
+   uvicorn==0.42.0
+   python-multipart==0.0.6
+   google-generativeai==0.7.2
+   chromadb==0.4.24
+   sentence-transformers==2.7.0
+   PyMuPDF==1.27.2.3
+   python-dotenv==1.0.0
+   ```
 
-```bash
-cd CRAM-ai
-git add .
-git commit -m "Add deployment config"
-git push origin master
-```
+### Phase 2: Deploy Backend to Railway
 
-Then in Railway dashboard:
-- New Project → Deploy from GitHub → Select repo
-- Wait for build and deployment
-- Copy public URL
+1. **Sign up**: https://railway.app
+2. **New Project**: Select "Deploy from GitHub"
+3. **Connect repository**: Choose your forked CRAM.ai repo
+4. **Wait for auto-detect**: Railway recognizes Python automatically
+5. **Configure variables**:
+   - `GOOGLE_API_KEY`: Your Google Gemini API key (get from https://makersuite.google.com/app/apikey)
+   - `PORT`: 8000
+6. **Deploy**: Watch build logs; wait for "success"
+7. **Copy public URL**: Railway provides `https://<project>-prod.railway.app`
 
-### 3. Update Frontend Environment
+### Phase 3: Deploy Frontend to Vercel
 
-Create `frontend/.env.production`:
-```
-VITE_API_URL=https://your-railway-backend-url
-```
-
-Or in `frontend/vite.config.js`:
-```javascript
-export default defineConfig({
-  plugins: [react()],
-  define: {
-    'import.meta.env.VITE_API_URL': JSON.stringify(process.env.VITE_API_URL || 'https://your-railway-backend-url')
-  }
-})
-```
-
-### 4. Deploy Frontend to Vercel
-
-```bash
-# In Vercel Dashboard
-# Settings → Environment Variables
-VITE_API_URL=https://your-railway-backend-url
-
-# Redeploy
-```
+1. **Sign up**: https://vercel.com
+2. **New Project**: Import your GitHub repo
+3. **Configure**:
+   - Framework: Vite
+   - Root directory: `frontend`
+   - Build: `npm run build`
+   - Output: `dist`
+4. **Set environment variable**:
+   - `VITE_API_URL`: `https://<project>-prod.railway.app` (from Railway)
+5. **Deploy**: Wait for completion
+6. **Done**: Your app is live at `https://cramai-<random>.vercel.app`
 
 ---
 
@@ -193,32 +199,33 @@ VITE_API_URL=https://your-railway-backend-url
 ### Backend (CRAM ai/)
 
 ```env
-GOOGLE_API_KEY=AIza...                    # Required: Gemini API key
-PORT=8000                                 # Optional: defaults to 8000
-HOST=0.0.0.0                             # Optional: for production
-DATABASE_URL=sqlite:///chat_history.db   # Optional: custom DB path
-CHROMA_STORE_PATH=/app/data/chroma       # Optional: for persistence
+GOOGLE_API_KEY=<YOUR_GOOGLE_GEMINI_API_KEY>        # Required: from makersuite.google.com
+PORT=8000                                           # Optional: default is 8000
+HOST=0.0.0.0                                       # Optional: for production
+DATABASE_URL=sqlite:///chat_history.db             # Optional: custom DB path
+CHROMA_STORE_PATH=/app/data/chroma                 # Optional: persistent storage
 ```
 
 ### Frontend (frontend/)
 
 ```env
-VITE_API_URL=https://your-backend-url   # Backend API endpoint
+VITE_API_URL=<BACKEND_URL>                         # Backend API endpoint (e.g., https://cramai-prod.railway.app)
 ```
 
 ---
 
 ## CORS Configuration
 
-Backend `CRAM ai/main.py` should have CORS enabled for frontend domain:
+Backend `CRAM ai/main.py` uses CORS middleware to allow frontend requests. Update origins based on your deployment:
 
 ```python
 from fastapi.middleware.cors import CORSMiddleware
 
 origins = [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "https://your-vercel-frontend.vercel.app",  # Add your Vercel URL
+    "http://localhost:5173",              # Local development
+    "http://localhost:3000",              # Alternative dev port
+    "https://<your-vercel-domain>",       # Production frontend (e.g., cramai.vercel.app)
+    "https://<your-custom-domain>",       # Custom domain if applicable
 ]
 
 app.add_middleware(
@@ -229,6 +236,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 ```
+
+**Note**: Replace `<your-vercel-domain>` with your actual Vercel deployment domain.
 
 ---
 
@@ -263,96 +272,110 @@ app.add_middleware(
 
 ## Troubleshooting
 
-### Backend deployment fails
+### Backend Deployment Fails
 
-**Check logs**:
-```bash
-# Railway: View logs in dashboard
-# Render: Tail logs in service page
-# Look for: Python dependency errors, API key issues
-```
+**Debug steps**:
+1. Check platform build logs (Railway/Render dashboard)
+2. Look for Python errors, missing dependencies, or API key issues
+3. Verify `Procfile` exists and is correctly formatted
 
 **Common issues**:
-- Missing `Procfile`
-- Python version mismatch (3.9+)
-- Missing `GOOGLE_API_KEY`
-- Port binding to 8000 (use `$PORT` env var)
+- Missing `Procfile` → Create: `web: uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Python version mismatch → Ensure Python 3.9+
+- Missing `GOOGLE_API_KEY` → Add via environment variables
+- Port binding failure → Use `$PORT` environment variable (not hardcoded)
 
-### Frontend can't reach backend
+### Frontend Can't Reach Backend
 
 **Debug**:
-```javascript
-// In browser console (frontend/src/App.jsx)
-console.log('API URL:', import.meta.env.VITE_API_URL)
+1. Open browser console (F12)
+2. Run:
+   ```javascript
+   console.log('API URL:', import.meta.env.VITE_API_URL)
+   fetch('https://<backend-url>/').then(r => r.json()).then(console.log)
+   ```
+3. Check network tab for CORS errors
 
-// Test backend connectivity
-fetch('https://your-backend-url/').then(r => r.json()).then(console.log)
-```
+**Common fixes**:
+- `VITE_API_URL` environment variable not set
+- Backend CORS not configured for frontend domain
+- Backend not running or public URL incorrect
 
-**Fix**:
-- Ensure `VITE_API_URL` is set correctly
-- Check CORS headers in backend response
-- Verify backend is running and accessible
+### Gemini API Returns 503
 
-### Gemini API 503 errors
+**This is expected behavior** during high demand:
+- Gemini API occasionally experiences service unavailability
+- Retry button in UI handles this gracefully
+- Try again after a few minutes
 
-- Expected during high demand
-- Retry button handles gracefully
-- Consider adding exponential backoff (future enhancement)
+**Workaround** (optional):
+- Implement exponential backoff for retries
+- Monitor API status at https://status.cloud.google.com
 
 ---
 
-## Advanced: CI/CD Pipeline
+## Optional: CI/CD Pipeline
 
-Create `.github/workflows/deploy.yml`:
+Automate redeployment on every push to main/master branch.
+
+**GitHub Actions Example** (.github/workflows/deploy.yml):
 
 ```yaml
-name: Deploy to Railway
+name: Auto Deploy
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, main ]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Deploy to Railway
         run: |
           npm i -g @railway/cli
           railway deploy --token ${{ secrets.RAILWAY_TOKEN }}
 ```
 
----
-
-## Post-Deployment Monitoring
-
-1. **Error Tracking**: Set up Sentry or Rollbar
-2. **Uptime Monitoring**: Use UptimeRobot
-3. **Performance**: Monitor response times
-4. **Database**: Monitor ChromaDB and SQLite size
-5. **API Rate Limits**: Track Gemini API usage
+**Setup**:
+1. Generate Railway API token in account settings
+2. Add to GitHub Secrets: `RAILWAY_TOKEN`
+3. Push to trigger auto-deploy
 
 ---
 
-## Next Steps
+## Monitoring & Maintenance
 
-1. **Choose deployment platform** (Railway recommended)
-2. **Create accounts** (Railway + Vercel)
-3. **Add environment variables**
-4. **Deploy backend first** (get URL)
-5. **Deploy frontend** (pass backend URL)
-6. **Test end-to-end** (upload PDF, ask question)
-7. **Monitor in production**
+After deployment, monitor:
 
-**Estimated setup time**: 30-45 minutes
+1. **Error Tracking**: Set up Sentry or Rollbar for error notifications
+2. **Uptime Monitoring**: Use UptimeRobot to check backend health
+3. **Performance**: Monitor API response times (target: <2s)
+4. **Storage**: Track ChromaDB and SQLite database size
+5. **API Quota**: Monitor Google Gemini API usage (free tier limits)
 
 ---
 
-## Support & Resources
+## Final Checklist
 
-- Railway docs: https://docs.railway.app
-- Vercel docs: https://vercel.com/docs
-- FastAPI deployment: https://fastapi.tiangolo.com/deployment/
-- React deployment: https://react.dev/learn/deployment
+- [ ] Backend deployed and accessible at `<backend-url>`
+- [ ] Frontend deployed and accessible at `<frontend-url>`
+- [ ] Upload a test PDF and verify ingestion works
+- [ ] Ask a test question and verify answer generation
+- [ ] Check console for errors (browser F12)
+- [ ] Test on multiple devices (desktop, mobile)
+- [ ] Share deployed URLs with team/users
+
+**Expected time**: 45 minutes to full deployment
+
+---
+
+## Resources
+
+- **Railway**: https://docs.railway.app
+- **Vercel**: https://vercel.com/docs
+- **FastAPI**: https://fastapi.tiangolo.com/deployment/
+- **React**: https://react.dev/learn/deployment
+- **ChromaDB**: https://docs.trychroma.com/
+- **Google Gemini**: https://makersuite.google.com
