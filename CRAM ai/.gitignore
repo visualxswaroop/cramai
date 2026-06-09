@@ -1,6 +1,7 @@
-venv/
 chroma_store/
 chat_history.db
-.env
+*.db
 __pycache__/
-*.pyc
+venv/
+.env
+notes.pdf
