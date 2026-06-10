@@ -1,8 +1,9 @@
 import os
 import sqlite3
+import uuid
 import fitz
 import chromadb
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -28,12 +29,15 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 chroma_client = chromadb.PersistentClient(path="./chroma_store")
 collection = chroma_client.get_or_create_collection(name="academic_notes")
 
-# Semantic chunker for ingestion
 semantic_chunker = SemanticChunker(
     embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2"),
     breakpoint_threshold_type="percentile",
     breakpoint_threshold_amount=85
 )
+
+# ── In-memory job tracker ─────────────────────────────────────────────────────
+# job_id -> {"status": "processing"|"done"|"error", "chunks_stored": int, "error": str}
+jobs: dict = {}
 
 # ── Database setup ────────────────────────────────────────────────────────────
 def init_db():
@@ -58,10 +62,7 @@ def extract_text(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not open PDF. Ensure the file is a valid PDF document."
-        ) from exc
+        raise ValueError("Could not open PDF. Ensure the file is a valid PDF document.") from exc
 
     text = ""
     for page_num, page in enumerate(doc):
@@ -82,6 +83,63 @@ def embed(texts: list[str]) -> list[list[float]]:
     return embedding_model.encode(
         texts, batch_size=32, convert_to_numpy=True
     ).tolist()
+
+
+# ── Background ingestion task ─────────────────────────────────────────────────
+def run_ingestion(job_id: str, file_bytes: bytes, filename: str,
+                  subject: str, resource_type: str):
+    try:
+        jobs[job_id] = {"status": "processing", "chunks_stored": 0}
+
+        text = extract_text(file_bytes)
+        if not text.strip():
+            jobs[job_id] = {"status": "error", "error": "Could not extract text. PDF may be scanned."}
+            return
+
+        chunks = chunk_text_semantic(text)
+        embeddings = embed(chunks)
+
+        ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
+        metadatas = [
+            {
+                "subject": subject,
+                "source": filename,
+                "chunk_index": i,
+                "resource_type": resource_type,
+                "chunk_length": len(chunks[i])
+            }
+            for i in range(len(chunks))
+        ]
+
+        try:
+            existing_ids = set(collection.get()["ids"])
+        except Exception:
+            existing_ids = set()
+
+        new = [
+            (i, e, c, m) for i, e, c, m in zip(ids, embeddings, chunks, metadatas)
+            if i not in existing_ids
+        ]
+
+        if new:
+            collection.add(
+                ids=[x[0] for x in new],
+                embeddings=[x[1] for x in new],
+                documents=[x[2] for x in new],
+                metadatas=[x[3] for x in new]
+            )
+
+        jobs[job_id] = {
+            "status": "done",
+            "chunks_stored": len(new),
+            "chunks_skipped": len(chunks) - len(new),
+            "subject": subject,
+            "filename": filename,
+            "resource_type": resource_type
+        }
+
+    except Exception as exc:
+        jobs[job_id] = {"status": "error", "error": str(exc)}
 
 
 # ── Query expansion ───────────────────────────────────────────────────────────
@@ -114,7 +172,6 @@ Alternative queries:"""
 # ── Retrieval with query expansion ────────────────────────────────────────────
 def retrieve_chunks(query: str, subject: str = None, top_k: int = 5):
     queries = expand_query(query)
-
     where_filter = {"subject": subject} if subject else None
 
     seen_ids = set()
@@ -129,11 +186,11 @@ def retrieve_chunks(query: str, subject: str = None, top_k: int = 5):
                 n_results=top_k,
                 where=where_filter
             )
-            docs = results["documents"][0]
-            metas = results["metadatas"][0]
-            ids = results["ids"][0]
-
-            for doc, meta, rid in zip(docs, metas, ids):
+            for doc, meta, rid in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["ids"][0]
+            ):
                 if rid not in seen_ids:
                     seen_ids.add(rid)
                     all_chunks.append(doc)
@@ -144,18 +201,14 @@ def retrieve_chunks(query: str, subject: str = None, top_k: int = 5):
     return all_chunks[:top_k * 2], all_metadatas[:top_k * 2]
 
 
-# ── Exam-style prompt builder ─────────────────────────────────────────────────
+# ── Prompt builder ────────────────────────────────────────────────────────────
 def build_prompt(query: str, chunks: list[str], marks: int = 5,
                  resource_type: str = "notes") -> str:
     context = "\n\n---\n\n".join(chunks)
 
     if marks <= 2:
-        length_instruction = (
-            "Write a precise 2-3 sentence answer. "
-            "State the definition or core fact directly. No extra detail."
-        )
+        length_instruction = "Write a precise 2-3 sentence answer. State the definition or core fact directly. No extra detail."
         word_target = "40-60 words"
-
     elif marks <= 5:
         length_instruction = (
             "Write a structured answer with:\n"
@@ -164,7 +217,6 @@ def build_prompt(query: str, chunks: list[str], marks: int = 5,
             "- One small example if available in the notes"
         )
         word_target = "150-200 words"
-
     else:
         length_instruction = (
             "Write a comprehensive exam answer structured as follows:\n"
@@ -179,7 +231,6 @@ def build_prompt(query: str, chunks: list[str], marks: int = 5,
         )
         word_target = "500-700 words minimum"
 
-    # Adjust tone based on resource type
     if resource_type == "pyq":
         resource_note = "This appears to be a previous year exam question. Match the exact depth and format expected in university exams."
     elif resource_type == "imp":
@@ -249,6 +300,7 @@ def root():
 
 @app.post("/ingest")
 async def ingest(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     subject: str = Form(...),
     resource_type: str = Form("notes")
@@ -257,56 +309,31 @@ async def ingest(
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     file_bytes = await file.read()
-    text = extract_text(file_bytes)
 
-    if not text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract text. PDF may be scanned or image-based."
-        )
+    # Generate a job ID and kick off background processing
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "processing", "chunks_stored": 0}
 
-    chunks = chunk_text_semantic(text)
-    embeddings = embed(chunks)
+    background_tasks.add_task(
+        run_ingestion, job_id, file_bytes, file.filename, subject, resource_type
+    )
 
-    filename = file.filename
-    ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [
-        {
-            "subject": subject,
-            "source": filename,
-            "chunk_index": i,
-            "resource_type": resource_type,
-            "chunk_length": len(chunks[i])
-        }
-        for i in range(len(chunks))
-    ]
-
-    try:
-        existing_ids = set(collection.get()["ids"])
-    except Exception:
-        existing_ids = set()
-
-    new = [
-        (i, e, c, m) for i, e, c, m in zip(ids, embeddings, chunks, metadatas)
-        if i not in existing_ids
-    ]
-
-    if new:
-        collection.add(
-            ids=[x[0] for x in new],
-            embeddings=[x[1] for x in new],
-            documents=[x[2] for x in new],
-            metadatas=[x[3] for x in new]
-        )
-
+    # Return immediately — frontend polls /ingest/status/{job_id}
     return {
-        "message": "Ingestion complete",
-        "filename": filename,
+        "message": "Ingestion started",
+        "job_id": job_id,
+        "filename": file.filename,
         "subject": subject,
-        "resource_type": resource_type,
-        "chunks_stored": len(new),
-        "chunks_skipped": len(chunks) - len(new)
+        "resource_type": resource_type
     }
+
+
+@app.get("/ingest/status/{job_id}")
+def ingest_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.post("/chat")
@@ -315,10 +342,8 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     save_message(req.session_id, "user", req.question)
-
     chunks, metadatas = retrieve_chunks(req.question, req.subject)
 
-    # Detect resource_type from retrieved chunks if not specified
     resource_type = req.resource_type
     if metadatas:
         resource_type = metadatas[0].get("resource_type", "notes")
@@ -332,10 +357,7 @@ def chat(req: ChatRequest):
         )
         answer = response.text
     except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc)
-        ) from exc
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     save_message(req.session_id, "assistant", answer)
 
@@ -371,7 +393,6 @@ def list_subjects():
 
 @app.get("/resources/{subject}")
 def list_resources(subject: str):
-    """List all uploaded resources for a subject with their types."""
     try:
         all_items = collection.get(where={"subject": subject})
         resources = {}
