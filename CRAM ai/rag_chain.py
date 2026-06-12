@@ -2,7 +2,6 @@ import os
 import chromadb
 from dotenv import load_dotenv
 from google import genai
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -11,12 +10,15 @@ if not api_key:
     raise ValueError("GOOGLE_API_KEY not found in .env")
 
 client_genai = genai.Client(api_key=api_key)
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # ── 1. Retrieve relevant chunks ───────────────────────────────────────────────
 def retrieve_chunks(query: str, subject: str = None, top_k: int = 4):
-    query_embedding = embedding_model.encode(query).tolist()
+    response = client_genai.models.embed_content(
+        model="gemini-embedding-2",
+        contents=query
+    )
+    query_embedding = response.embeddings[0].values
 
     client = chromadb.PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(name="academic_notes")

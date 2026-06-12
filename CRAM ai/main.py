@@ -3,14 +3,15 @@ import sqlite3
 import uuid
 import fitz
 import chromadb
+import time
+import re
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
-from sentence_transformers import SentenceTransformer
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_huggingface import HuggingFaceEmbeddings
+from google.genai import types
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
@@ -25,14 +26,12 @@ app.add_middleware(
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 client_genai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 chroma_client = chromadb.PersistentClient(path="./chroma_store")
 collection = chroma_client.get_or_create_collection(name="academic_notes")
 
-semantic_chunker = SemanticChunker(
-    embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2"),
-    breakpoint_threshold_type="percentile",
-    breakpoint_threshold_amount=85
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200
 )
 
 # ── In-memory job tracker ─────────────────────────────────────────────────────
@@ -58,9 +57,9 @@ init_db()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def extract_text(file_bytes: bytes) -> str:
+def extract_text(pdf_path: str) -> str:
     try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        doc = fitz.open(pdf_path)
     except Exception as exc:
         raise ValueError("Could not open PDF. Ensure the file is a valid PDF document.") from exc
 
@@ -74,24 +73,60 @@ def extract_text(file_bytes: bytes) -> str:
 
 
 def chunk_text_semantic(text: str) -> list[str]:
-    chunks = semantic_chunker.split_text(text)
-    chunks = [c.strip() for c in chunks if len(c.strip()) > 80]
-    return chunks
+    chunks = text_splitter.split_text(text)
+    return [c.strip() for c in chunks if len(c.strip()) > 0]
 
 
 def embed(texts: list[str]) -> list[list[float]]:
-    return embedding_model.encode(
-        texts, batch_size=32, convert_to_numpy=True
-    ).tolist()
+    if not texts:
+        return []
+    all_embeddings = []
+    batch_size = 20
+    base_delay = 12.0  # 20 items per 12 seconds keeps us within the 100 RPM limit
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        contents = [types.Content(parts=[types.Part.from_text(text=t)]) for t in batch]
+        
+        success = False
+        attempt = 0
+        while not success:
+            try:
+                response = client_genai.models.embed_content(
+                    model="gemini-embedding-2",
+                    contents=contents
+                )
+                all_embeddings.extend([emb.values for emb in response.embeddings])
+                success = True
+                break
+            except Exception as e:
+                err_msg = str(e)
+                is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()
+                
+                if is_rate_limit:
+                    match = re.search(r"retry in ([\d\.]+)s", err_msg)
+                    if match:
+                        sleep_time = float(match.group(1)) + 1.0
+                    else:
+                        sleep_time = 15.0 * (1.5 ** attempt)
+                    print(f"Rate limit hit at chunk index {i}. Waiting for {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
+                    attempt += 1
+                else:
+                    raise e
+        
+        if success and i + batch_size < len(texts):
+            time.sleep(base_delay)
+            
+    return all_embeddings
 
 
 # ── Background ingestion task ─────────────────────────────────────────────────
-def run_ingestion(job_id: str, file_bytes: bytes, filename: str,
+def run_ingestion(job_id: str, temp_file_path: str, filename: str,
                   subject: str, resource_type: str):
     try:
         jobs[job_id] = {"status": "processing", "chunks_stored": 0}
 
-        text = extract_text(file_bytes)
+        text = extract_text(temp_file_path)
         if not text.strip():
             jobs[job_id] = {"status": "error", "error": "Could not extract text. PDF may be scanned."}
             return
@@ -140,6 +175,12 @@ def run_ingestion(job_id: str, file_bytes: bytes, filename: str,
 
     except Exception as exc:
         jobs[job_id] = {"status": "error", "error": str(exc)}
+    finally:
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
 
 
 # ── Query expansion ───────────────────────────────────────────────────────────
@@ -179,8 +220,13 @@ def retrieve_chunks(query: str, subject: str = None, top_k: int = 5):
     all_metadatas = []
 
     for q in queries:
-        q_embedding = embedding_model.encode(q).tolist()
         try:
+            response = client_genai.models.embed_content(
+                model="gemini-embedding-2",
+                contents=q
+            )
+            q_embedding = response.embeddings[0].values
+            
             results = collection.query(
                 query_embeddings=[q_embedding],
                 n_results=top_k,
@@ -308,14 +354,24 @@ async def ingest(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    file_bytes = await file.read()
+    # Create a unique temp file path in a local folder
+    temp_dir = os.path.join(os.path.dirname(__file__), "temp_uploads")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, f"{uuid.uuid4()}.pdf")
+    
+    with open(temp_file_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer.write(chunk)
 
     # Generate a job ID and kick off background processing
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "processing", "chunks_stored": 0}
 
     background_tasks.add_task(
-        run_ingestion, job_id, file_bytes, file.filename, subject, resource_type
+        run_ingestion, job_id, temp_file_path, file.filename, subject, resource_type
     )
 
     # Return immediately — frontend polls /ingest/status/{job_id}

@@ -1,11 +1,23 @@
+import os
 import chromadb
-from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from google import genai
 
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+load_dotenv()
+
+api_key = os.getenv("GOOGLE_API_KEY")
+if not api_key:
+    raise ValueError("GOOGLE_API_KEY not found in .env")
+
+client_genai = genai.Client(api_key=api_key)
 
 
 def retrieve(query: str, subject: str = None, top_k: int = 3):
-    query_embedding = embedding_model.encode(query).tolist()
+    response = client_genai.models.embed_content(
+        model="gemini-embedding-2",
+        contents=query
+    )
+    query_embedding = response.embeddings[0].values
 
     client = chromadb.PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(name="academic_notes")
@@ -18,7 +30,7 @@ def retrieve(query: str, subject: str = None, top_k: int = 3):
         where=where_filter
     )
 
-    print(f"\n── Top {top_k} chunks for: '{query}' ──\n")
+    print(f"\n-- Top {top_k} chunks for: '{query}' --\n")
     for i, (doc, meta) in enumerate(
         zip(results["documents"][0], results["metadatas"][0])
     ):
