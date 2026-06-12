@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react"
 import axios from "axios"
 import ReactMarkdown from "react-markdown"
 
-const API = "http://127.0.0.1:8000"
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
 export default function App() {
   const [subject, setSubject] = useState("")
@@ -14,9 +14,9 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const [uploadMsg, setUploadMsg] = useState("")
   const [uploadOk, setUploadOk] = useState(false)
+  const [uploadStage, setUploadStage] = useState("")
   const [activeFile, setActiveFile] = useState("")
   const [copiedIndex, setCopiedIndex] = useState(null)
-  const [uploadProgress, setUploadProgress] = useState(0)
   const [noSubjectWarning, setNoSubjectWarning] = useState(false)
   const [resourceType, setResourceType] = useState("notes")
   const [sessionId] = useState("session-" + Date.now())
@@ -24,6 +24,7 @@ export default function App() {
   const [lastRetryableMessageIndex, setLastRetryableMessageIndex] = useState(null)
   const bottomRef = useRef(null)
   const textareaRef = useRef(null)
+  const pollRef = useRef(null)
 
   useEffect(() => {
     axios.get(`${API}/subjects`).then(r => setSubjects(r.data.subjects)).catch(() => {})
@@ -33,13 +34,14 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
-  // Auto-resize textarea
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "24px"
       textareaRef.current.style.height = textareaRef.current.scrollHeight + "px"
     }
   }, [question])
+
+  useEffect(() => () => clearInterval(pollRef.current), [])
 
   async function handleUpload(e) {
     const file = e.target.files[0]
@@ -48,88 +50,105 @@ export default function App() {
       setUploadMsg("Enter a subject name first.")
       return
     }
+
     setUploading(true)
-    setUploadProgress(0)
     setUploadMsg("")
     setUploadOk(false)
+    setUploadStage("Uploading PDF...")
+
     const form = new FormData()
     form.append("file", file)
     form.append("subject", subject)
     form.append("resource_type", resourceType)
-    
-    const progressInterval = setInterval(() => {
-      setUploadProgress(prev => Math.min(prev + Math.random() * 25, 95))
-    }, 800)
-    
+
     try {
+      // Step 1 — send file, get job_id back immediately
       const r = await axios.post(`${API}/ingest`, form)
-      clearInterval(progressInterval)
-      setUploadProgress(100)
-      setUploadOk(true)
-      setUploadMsg(`✓ ${r.data.chunks_stored} chunks stored · ${resourceType.toUpperCase()}`)
-      setSubjects(prev => [...new Set([...prev, subject])])
-      setActiveFile(file.name)
+      const jobId = r.data.job_id
+      const filename = r.data.filename
+
+      setUploadStage("Processing — semantic chunking...")
+
+      // Step 2 — poll /ingest/status/:job_id every 4 seconds
+      const stages = [
+        "Extracting text from PDF...",
+        "Running semantic chunking...",
+        "Generating embeddings...",
+        "Storing in database...",
+        "Almost done...",
+      ]
+      let stageIndex = 0
+
+      pollRef.current = setInterval(async () => {
+        stageIndex = Math.min(stageIndex + 1, stages.length - 1)
+        setUploadStage(stages[stageIndex])
+
+        try {
+          const status = await axios.get(`${API}/ingest/status/${jobId}`)
+          const job = status.data
+
+          if (job.status === "done") {
+            clearInterval(pollRef.current)
+            setUploadOk(true)
+            setUploadStage("")
+            setUploadMsg(`✓ ${job.chunks_stored} chunks stored · ${resourceType.toUpperCase()}`)
+            setSubjects(prev => [...new Set([...prev, subject])])
+            setActiveFile(filename)
+            setUploading(false)
+          } else if (job.status === "error") {
+            clearInterval(pollRef.current)
+            setUploadOk(false)
+            setUploadStage("")
+            setUploadMsg(job.error || "Ingestion failed.")
+            setUploading(false)
+          }
+          // if still "processing", keep polling
+        } catch {
+          // network blip, keep polling
+        }
+      }, 4000)
+
     } catch (error) {
-      clearInterval(progressInterval)
-      setUploadProgress(0)
       setUploadOk(false)
+      setUploadStage("")
       const msg = error?.response?.data?.detail || error?.message
       setUploadMsg(msg || "Upload failed. Check if the PDF has selectable text.")
-    } finally {
       setUploading(false)
-      setTimeout(() => setUploadProgress(0), 500)
+    } finally {
       e.target.value = ""
     }
   }
 
   async function handleSend() {
     if (!question.trim()) return
-    
     if (!subject.trim()) {
       setNoSubjectWarning(true)
       setTimeout(() => setNoSubjectWarning(false), 3500)
       return
     }
-    
+
     const userMsg = { role: "user", content: question }
     setMessages(prev => [...prev, userMsg])
     setQuestion("")
     setLoading(true)
-    
-    // Store retry parameters in case of 503 error
-    const queryParams = {
-      question: question,
-      subject: subject || null,
-      marks,
-      resource_type: resourceType
-    }
+
+    const queryParams = { question: question, subject: subject || null, marks, resource_type: resourceType }
     setRetryParams(queryParams)
-    
+
     try {
-      const r = await axios.post(`${API}/chat`, {
-        ...queryParams,
-        session_id: sessionId
-      })
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: r.data.answer,
-        sources: r.data.sources
-      }])
+      const r = await axios.post(`${API}/chat`, { ...queryParams, session_id: sessionId })
+      setMessages(prev => [...prev, { role: "assistant", content: r.data.answer, sources: r.data.sources }])
       setRetryParams(null)
     } catch (error) {
       const serverMessage = error?.response?.data?.detail || error?.message
       const is503 = error?.response?.status === 503
-      const msgIndex = messages.length + 1 // +1 for the user message we just added
-      
+      const msgIndex = messages.length + 1
       setMessages(prev => [...prev, {
         role: "assistant",
         content: serverMessage || "Could not reach the backend. Make sure it's running.",
         isRetryable: is503
       }])
-      
-      if (is503) {
-        setLastRetryableMessageIndex(msgIndex)
-      }
+      if (is503) setLastRetryableMessageIndex(msgIndex)
     } finally {
       setLoading(false)
     }
@@ -137,42 +156,27 @@ export default function App() {
 
   async function handleRetry() {
     if (!retryParams) return
-    
     setMessages(prev => {
       const updated = [...prev]
-      if (lastRetryableMessageIndex !== null) {
-        updated[lastRetryableMessageIndex].isRetryable = false
-      }
+      if (lastRetryableMessageIndex !== null) updated[lastRetryableMessageIndex].isRetryable = false
       return updated
     })
-    
     setLoading(true)
     try {
-      const r = await axios.post(`${API}/chat`, {
-        ...retryParams,
-        session_id: sessionId
-      })
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: r.data.answer,
-        sources: r.data.sources
-      }])
+      const r = await axios.post(`${API}/chat`, { ...retryParams, session_id: sessionId })
+      setMessages(prev => [...prev, { role: "assistant", content: r.data.answer, sources: r.data.sources }])
       setRetryParams(null)
       setLastRetryableMessageIndex(null)
     } catch (error) {
       const serverMessage = error?.response?.data?.detail || error?.message
       const is503 = error?.response?.status === 503
       const msgIndex = messages.length
-      
       setMessages(prev => [...prev, {
         role: "assistant",
-        content: serverMessage || "Could not reach the backend. Make sure it's running.",
+        content: serverMessage || "Could not reach the backend.",
         isRetryable: is503
       }])
-      
-      if (is503) {
-        setLastRetryableMessageIndex(msgIndex)
-      }
+      if (is503) setLastRetryableMessageIndex(msgIndex)
     } finally {
       setLoading(false)
     }
@@ -191,7 +195,6 @@ export default function App() {
   }
 
   const marksLabel = marks <= 2 ? "Short" : marks <= 5 ? "Medium" : "Detailed"
-
   const resourceTypes = [
     { value: "notes", label: "Notes" },
     { value: "pyq", label: "PYQ" },
@@ -203,41 +206,21 @@ export default function App() {
     <>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
         :root {
-          --bg-space: #030014;
-          --bg-sidebar: rgba(6, 4, 18, 0.7);
-          --bg-card: rgba(13, 9, 33, 0.45);
-          --bg-input: rgba(15, 12, 38, 0.5);
-          --accent-purple: #a855f7;
-          --accent-purple-dim: rgba(168, 85, 247, 0.12);
-          --accent-glow: rgba(168, 85, 247, 0.4);
-          --border-subtle: rgba(168, 85, 247, 0.15);
-          --border-dim: rgba(255, 255, 255, 0.05);
-          --border-bright: rgba(255, 255, 255, 0.12);
-          --text-primary: #f8fafc;
-          --text-secondary: #94a3b8;
-          --text-muted: #64748b;
-          --glass-blur: blur(24px);
+          --bg-space: #030014; --bg-sidebar: rgba(6,4,18,0.7); --bg-card: rgba(13,9,33,0.45);
+          --bg-input: rgba(15,12,38,0.5); --accent-purple: #a855f7;
+          --accent-purple-dim: rgba(168,85,247,0.12); --accent-glow: rgba(168,85,247,0.4);
+          --border-subtle: rgba(168,85,247,0.15); --border-dim: rgba(255,255,255,0.05);
+          --border-bright: rgba(255,255,255,0.12); --text-primary: #f8fafc;
+          --text-secondary: #94a3b8; --text-muted: #64748b; --glass-blur: blur(24px);
         }
-
-        html, body, #root {
-          height: 100%;
-          background: var(--bg-space);
-          color: var(--text-primary);
-          overflow: hidden;
-          font-family: 'Plus Jakarta Sans', sans-serif;
-        }
-
+        html, body, #root { height: 100%; background: var(--bg-space); color: var(--text-primary); overflow: hidden; font-family: 'Plus Jakarta Sans', sans-serif; }
         .ambient-orbs { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
         .orb-top-left { position: absolute; width: 800px; height: 800px; background: radial-gradient(circle, rgba(147,51,234,0.15) 0%, transparent 65%); top: -350px; left: -250px; border-radius: 50%; }
         .orb-bottom-right { position: absolute; width: 600px; height: 600px; background: radial-gradient(circle, rgba(168,85,247,0.08) 0%, transparent 70%); bottom: -200px; right: -100px; border-radius: 50%; }
         .bg-grid-overlay { position: absolute; inset: 0; background-image: radial-gradient(rgba(168,85,247,0.06) 1.2px, transparent 1.2px); background-size: 32px 32px; opacity: 0.85; }
-
         .layout { position: relative; z-index: 2; display: flex; flex-direction: column; height: 100vh; }
-
         .header { display: flex; align-items: center; justify-content: space-between; padding: 0 32px; height: 68px; border-bottom: 1px solid var(--border-dim); background: rgba(4,2,14,0.65); backdrop-filter: var(--glass-blur); flex-shrink: 0; }
         .header-brand { display: flex; align-items: center; gap: 12px; cursor: pointer; }
         .header-logo-container { position: relative; display: flex; align-items: center; justify-content: center; }
@@ -250,67 +233,56 @@ export default function App() {
         .status-dot-pulse { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px rgba(16,185,129,0.6); position: relative; }
         .status-dot-pulse::after { content: ''; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid #10b981; animation: status-pulse 1.8s cubic-bezier(0.24,0,0.38,1) infinite; }
         @keyframes status-pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(2.4); opacity: 0; } }
-
         .body { display: flex; flex: 1; overflow: hidden; }
-
         .sidebar { width: 290px; flex-shrink: 0; border-right: 1px solid var(--border-dim); background: var(--bg-sidebar); backdrop-filter: var(--glass-blur); padding: 28px 24px; display: flex; flex-direction: column; gap: 28px; overflow-y: auto; }
         .sidebar::-webkit-scrollbar { width: 4px; }
         .sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.05); border-radius: 10px; }
         .sidebar-section { display: flex; flex-direction: column; gap: 10px; }
         .section-header { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 700; font-family: 'Space Grotesk', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
         .section-icon { width: 14px; height: 14px; color: var(--accent-purple); }
-
         .field-container { position: relative; }
         .field-input { width: 100%; background: var(--bg-input); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 12px 14px 12px 38px; font-size: 13.5px; font-family: inherit; color: var(--text-primary); outline: none; transition: all 0.3s cubic-bezier(0.16,1,0.3,1); }
         .field-input-icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--text-muted); pointer-events: none; }
         .field-input:focus { border-color: var(--accent-purple); background: rgba(168,85,247,0.06); box-shadow: 0 0 0 3px rgba(168,85,247,0.15); }
         .field-input::placeholder { color: var(--text-muted); }
-
-        /* Resource type selector */
         .resource-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
         .resource-btn { padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border-dim); background: rgba(255,255,255,0.02); color: var(--text-muted); font-size: 11px; font-weight: 600; font-family: 'Space Grotesk', sans-serif; letter-spacing: 0.05em; cursor: pointer; transition: all 0.2s; text-align: center; }
         .resource-btn:hover { border-color: var(--border-subtle); color: var(--text-secondary); }
         .resource-btn.active { background: var(--accent-purple-dim); border-color: var(--accent-purple); color: #fff; box-shadow: 0 0 10px rgba(168,85,247,0.2); }
-
         .marks-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
         .marks-val { font-size: 12px; font-family: 'Space Grotesk', sans-serif; font-weight: 600; color: var(--accent-purple); background: var(--accent-purple-dim); padding: 2px 8px; border-radius: 6px; }
         .slider-wrapper { position: relative; padding: 8px 0; }
         input[type=range] { width: 100%; appearance: none; height: 5px; background: rgba(255,255,255,0.08); border-radius: 6px; outline: none; cursor: pointer; }
         input[type=range]::-webkit-slider-thumb { appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #ffffff; border: 3px solid var(--accent-purple); box-shadow: 0 0 12px var(--accent-purple); cursor: pointer; transition: transform 0.2s; }
         input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.3); background: var(--accent-purple); border-color: #ffffff; }
-
-        .upload-card { display: block; width: 100%; border: 1.5px dashed var(--border-subtle); border-radius: 12px; padding: 24px 16px; text-align: center; cursor: pointer; background: rgba(168,85,247,0.02); transition: all 0.3s cubic-bezier(0.16,1,0.3,1); position: relative; overflow: hidden; }
+        .upload-card { display: block; width: 100%; border: 1.5px dashed var(--border-subtle); border-radius: 12px; padding: 20px 16px 16px; text-align: center; cursor: pointer; background: rgba(168,85,247,0.02); transition: all 0.3s cubic-bezier(0.16,1,0.3,1); position: relative; overflow: hidden; }
         .upload-card:hover:not(.uploading) { border-color: var(--accent-purple); background: rgba(168,85,247,0.06); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(168,85,247,0.08); }
-        .upload-card.uploading { opacity: 0.7; cursor: not-allowed; }
+        .upload-card.uploading { cursor: not-allowed; border-color: rgba(168,85,247,0.3); background: rgba(168,85,247,0.04); }
         .upload-card-glow { position: absolute; inset: 0; background: radial-gradient(circle at center, rgba(168,85,247,0.1) 0%, transparent 70%); opacity: 0; transition: opacity 0.3s; }
         .upload-card:hover .upload-card-glow { opacity: 1; }
         .upload-card-icon-box { width: 44px; height: 44px; margin: 0 auto 12px; border-radius: 10px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-dim); display: flex; align-items: center; justify-content: center; color: var(--accent-purple); transition: all 0.3s; }
-        .upload-card:hover .upload-card-icon-box { background: var(--accent-purple); color: #fff; box-shadow: 0 0 15px var(--accent-glow); }
+        .upload-card:hover:not(.uploading) .upload-card-icon-box { background: var(--accent-purple); color: #fff; box-shadow: 0 0 15px var(--accent-glow); }
         .upload-card-icon { width: 20px; height: 20px; stroke-width: 2px; }
         .upload-card-title { font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
         .upload-card-subtitle { font-size: 11px; color: var(--text-muted); }
+        .upload-stage-label { font-size: 11px; font-family: 'Space Grotesk', sans-serif; font-weight: 600; color: var(--accent-purple); margin-top: 10px; letter-spacing: 0.03em; animation: pulse-text 1.5s ease-in-out infinite alternate; }
+        @keyframes pulse-text { 0% { opacity: 0.6; } 100% { opacity: 1; } }
+        .upload-shimmer { width: 100%; height: 3px; background: rgba(168,85,247,0.1); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+        .upload-shimmer-bar { height: 100%; width: 40%; background: linear-gradient(90deg, transparent, #a855f7, transparent); border-radius: 2px; animation: shimmer 1.5s ease-in-out infinite; }
+        @keyframes shimmer { 0% { transform: translateX(-150%); } 100% { transform: translateX(350%); } }
         .upload-status-message { font-size: 11.5px; margin-top: 10px; line-height: 1.5; padding: 8px 12px; border-radius: 8px; border: 1px solid transparent; animation: slideDown 0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
         .upload-status-message.success { background: rgba(16,185,129,0.08); border-color: rgba(16,185,129,0.2); color: #34d399; }
         .upload-status-message.error { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.2); color: #f87171; }
-        
-        .upload-progress-bar { width: 100%; height: 4px; background: rgba(168,85,247,0.1); border-radius: 2px; margin-top: 8px; overflow: hidden; }
-        .upload-progress-fill { height: 100%; background: linear-gradient(90deg, #a855f7 0%, #c084fc 100%); border-radius: 2px; transition: width 0.3s ease-out; box-shadow: 0 0 8px rgba(168,85,247,0.6); }
-        
         .subject-warning { display: flex; align-items: center; font-size: 12px; color: #fbbf24; background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.2); padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; animation: slideDown 0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
-        
         .retry-btn { background: linear-gradient(135deg, #f97316 0%, #fb923c 100%); color: #fff; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.25s; box-shadow: 0 2px 8px rgba(249,115,22,0.3); }
         .retry-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(249,115,22,0.5); }
         .retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        
         @keyframes slideDown { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
-
         .pills-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 4px; }
         .pill-item { font-size: 12px; font-weight: 500; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border-dim); background: rgba(255,255,255,0.02); color: var(--text-secondary); cursor: pointer; transition: all 0.25s; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .pill-item:hover { border-color: var(--border-subtle); color: var(--text-primary); background: rgba(255,255,255,0.05); transform: scale(1.02); }
         .pill-item.active { background: var(--accent-purple-dim); border-color: var(--accent-purple); color: #fff; font-weight: 600; box-shadow: 0 0 12px rgba(168,85,247,0.2); }
-
         .sidebar-divider { height: 1px; background: var(--border-dim); margin: 4px 0; }
-
         .active-context-card { display: flex; align-items: center; gap: 12px; background: rgba(168,85,247,0.04); border: 1px solid rgba(168,85,247,0.25); border-radius: 12px; padding: 14px; position: relative; overflow: hidden; animation: slideDown 0.3s cubic-bezier(0.16,1,0.3,1) forwards; }
         .active-context-glow { position: absolute; width: 80px; height: 80px; background: radial-gradient(circle, rgba(168,85,247,0.15) 0%, transparent 70%); filter: blur(8px); top: -20px; left: -20px; pointer-events: none; }
         .active-context-icon { width: 24px; height: 24px; color: var(--accent-purple); flex-shrink: 0; filter: drop-shadow(0 0 6px var(--accent-glow)); }
@@ -321,12 +293,10 @@ export default function App() {
         .active-context-status-dot { width: 6px; height: 6px; border-radius: 50%; background: #10b981; box-shadow: 0 0 6px rgba(16,185,129,0.8); flex-shrink: 0; animation: active-pulse 2s infinite alternate; }
         @keyframes active-pulse { 0% { opacity: 0.5; } 100% { opacity: 1; } }
         .active-context-status-text { font-size: 10px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
-
         .chat-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
         .chat-scroller { flex: 1; overflow-y: auto; padding: 40px 48px; display: flex; flex-direction: column; gap: 28px; }
         .chat-scroller::-webkit-scrollbar { width: 5px; }
         .chat-scroller::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.05); border-radius: 10px; }
-
         .empty-workspace { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 600px; margin: auto; padding: 20px; animation: fade-in 0.6s cubic-bezier(0.16,1,0.3,1) forwards; }
         @keyframes fade-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
         .empty-brand-sphere { position: relative; width: 110px; height: 110px; margin-bottom: 24px; display: flex; align-items: center; justify-content: center; }
@@ -341,7 +311,6 @@ export default function App() {
         .feature-card-icon { width: 22px; height: 22px; color: var(--accent-purple); margin-bottom: 12px; }
         .feature-card-heading { font-size: 13.5px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
         .feature-card-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
-
         .msg-row { display: flex; width: 100%; animation: msg-slide-in 0.45s cubic-bezier(0.16,1,0.3,1) forwards; }
         @keyframes msg-slide-in { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
         .msg-row.user { justify-content: flex-end; }
@@ -350,24 +319,14 @@ export default function App() {
         .msg-avatar { width: 36px; height: 36px; border-radius: 50%; background: rgba(255,255,255,0.03); border: 1px solid var(--border-dim); display: flex; align-items: center; justify-content: center; color: var(--accent-purple); }
         .msg-avatar.assistant-avatar { background: rgba(168,85,247,0.1); border-color: var(--border-subtle); box-shadow: 0 0 12px rgba(168,85,247,0.15); }
         .msg-avatar-icon { width: 18px; height: 18px; }
-
         .bubble { max-width: 72%; border-radius: 16px; padding: 16px 20px; font-size: 14px; line-height: 1.75; position: relative; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
         .bubble.user { background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.24); border-top-right-radius: 4px; color: var(--text-primary); }
         .bubble.assistant { background: var(--bg-card); border: 1px solid var(--border-dim); border-top-left-radius: 4px; color: #e2e8f0; backdrop-filter: var(--glass-blur); }
-
-        /* ── Markdown styles ── */
         .md-body p { margin-bottom: 10px; }
         .md-body p:last-child { margin-bottom: 0; }
         .md-body strong { font-weight: 700; color: #e2e8f0; }
         .md-body em { font-style: italic; color: var(--text-secondary); }
-        .md-body h1, .md-body h2, .md-body h3, .md-body h4 {
-          font-family: 'Space Grotesk', sans-serif;
-          font-weight: 700;
-          color: #ffffff;
-          margin: 18px 0 8px;
-          line-height: 1.3;
-          letter-spacing: -0.01em;
-        }
+        .md-body h1, .md-body h2, .md-body h3, .md-body h4 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; color: #ffffff; margin: 18px 0 8px; line-height: 1.3; letter-spacing: -0.01em; }
         .md-body h1 { font-size: 18px; border-bottom: 1px solid var(--border-dim); padding-bottom: 6px; }
         .md-body h2 { font-size: 16px; color: #c084fc; }
         .md-body h3 { font-size: 14.5px; color: var(--text-primary); }
@@ -385,10 +344,8 @@ export default function App() {
         .md-body td { padding: 9px 14px; border-bottom: 1px solid var(--border-dim); color: var(--text-secondary); }
         .md-body tr:hover td { background: rgba(255,255,255,0.02); }
         .md-body hr { border: none; border-top: 1px solid var(--border-dim); margin: 16px 0; }
-
         .copy-btn { position: absolute; top: 12px; right: 14px; padding: 5px 10px; border: none; border-radius: 999px; background: rgba(255,255,255,0.08); color: #f8fafc; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
         .copy-btn:hover { background: rgba(255,255,255,0.14); transform: translateY(-1px); }
-
         .sources-pane { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-dim); }
         .sources-headline { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; font-family: 'Space Grotesk', sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
         .sources-headline-icon { width: 12px; height: 12px; color: var(--accent-purple); }
@@ -397,13 +354,11 @@ export default function App() {
         .source-tag:hover { background: rgba(168,85,247,0.15); border-color: var(--accent-purple); color: #fff; }
         .source-tag-icon { width: 11px; height: 11px; }
         .source-type-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; background: rgba(168,85,247,0.2); padding: 1px 5px; border-radius: 3px; color: #d8b4fe; }
-
         .typing-box { display: flex; gap: 6px; align-items: center; padding: 6px 4px; }
         .typing-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-purple); box-shadow: 0 0 8px var(--accent-glow); animation: dot-jump 1.4s ease-in-out infinite; opacity: 0.4; }
         .typing-dot:nth-child(2) { animation-delay: 0.2s; }
         .typing-dot:nth-child(3) { animation-delay: 0.4s; }
         @keyframes dot-jump { 0%,80%,100% { opacity: 0.4; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-6px); } }
-
         .input-deck { padding: 0 48px 32px; flex-shrink: 0; background: linear-gradient(to top, var(--bg-space) 75%, transparent); position: relative; z-index: 10; }
         .input-glass-bar { max-width: 900px; margin: 0 auto; background: rgba(15,11,41,0.45); border: 1px solid var(--border-subtle); border-radius: 16px; padding: 14px 18px; backdrop-filter: var(--glass-blur); box-shadow: 0 12px 40px rgba(0,0,0,0.6), 0 0 20px rgba(168,85,247,0.08); transition: all 0.3s; }
         .input-glass-bar:focus-within { border-color: var(--accent-purple); box-shadow: 0 12px 40px rgba(0,0,0,0.7), 0 0 30px rgba(168,85,247,0.16); background: rgba(15,11,41,0.55); }
@@ -419,42 +374,34 @@ export default function App() {
       `}</style>
 
       <div className="ambient-orbs">
-        <div className="orb-top-left" />
-        <div className="orb-bottom-right" />
-        <div className="bg-grid-overlay" />
+        <div className="orb-top-left"/><div className="orb-bottom-right"/><div className="bg-grid-overlay"/>
       </div>
 
       <div className="layout">
         <header className="header">
           <div className="header-brand" onClick={() => window.location.reload()}>
             <div className="header-logo-container">
-              <div className="header-logo-glow" />
-              <svg style={{ width: 28, height: 28, color: "var(--accent-purple)" }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 2L2 7L12 12L22 7L12 2Z"/>
-                <path d="M2 17L12 22L22 17"/>
-                <path d="M2 12L12 17L22 12"/>
+              <div className="header-logo-glow"/>
+              <svg style={{width:28,height:28,color:"var(--accent-purple)"}} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2L2 7L12 12L22 7L12 2Z"/><path d="M2 17L12 22L22 17"/><path d="M2 12L12 17L22 12"/>
               </svg>
             </div>
             <h1 className="brand-text">CRAM<span>.ai</span></h1>
           </div>
           <div className="header-right">
-            <div className="status-pill">
-              <div className="status-dot-pulse" />
-              RAG · Gemini 2.5 Active
-            </div>
+            <div className="status-pill"><div className="status-dot-pulse"/>RAG · Gemini 2.5 Active</div>
           </div>
         </header>
 
         <div className="body">
           <aside className="sidebar">
-
             <div className="sidebar-section">
               <div className="section-header">
                 <svg className="section-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
                 Subject Focus
               </div>
               <div className="field-container">
-                <input className="field-input" placeholder="e.g. DBMS, OS, Networks..." value={subject} onChange={e => setSubject(e.target.value)} />
+                <input className="field-input" placeholder="e.g. DBMS, OS, Networks..." value={subject} onChange={e => setSubject(e.target.value)}/>
                 <svg className="field-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </div>
             </div>
@@ -466,9 +413,7 @@ export default function App() {
               </div>
               <div className="resource-grid">
                 {resourceTypes.map(rt => (
-                  <button key={rt.value} className={`resource-btn ${resourceType === rt.value ? "active" : ""}`} onClick={() => setResourceType(rt.value)}>
-                    {rt.label}
-                  </button>
+                  <button key={rt.value} className={`resource-btn ${resourceType === rt.value ? "active" : ""}`} onClick={() => setResourceType(rt.value)}>{rt.label}</button>
                 ))}
               </div>
             </div>
@@ -482,11 +427,11 @@ export default function App() {
                 <div className="marks-val">{marksLabel} · {marks}m</div>
               </div>
               <div className="slider-wrapper">
-                <input type="range" min={2} max={10} step={1} value={marks} onChange={e => setMarks(Number(e.target.value))} />
+                <input type="range" min={2} max={10} step={1} value={marks} onChange={e => setMarks(Number(e.target.value))}/>
               </div>
             </div>
 
-            <div className="sidebar-divider" />
+            <div className="sidebar-divider"/>
 
             <div className="sidebar-section">
               <div className="section-header">
@@ -494,22 +439,26 @@ export default function App() {
                 Upload Material
               </div>
               <label className={`upload-card ${uploading ? "uploading" : ""}`}>
-                <div className="upload-card-glow" />
+                <div className="upload-card-glow"/>
                 <div className="upload-card-icon-box">
-                  <svg className="upload-card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>
-                  </svg>
+                  {uploading ? (
+                    <svg className="upload-card-icon" style={{animation:"spin 1.2s linear infinite"}} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+                    </svg>
+                  ) : (
+                    <svg className="upload-card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>
+                    </svg>
+                  )}
                 </div>
-                <div className="upload-card-title">{uploading ? "Ingesting PDF..." : "Drop or Select PDF"}</div>
-                <div className="upload-card-subtitle">{uploading ? "Semantic chunking in progress..." : `Will tag as · ${resourceType.toUpperCase()}`}</div>
-                {uploading && uploadProgress > 0 && (
-                  <div className="upload-progress-bar">
-                    <div className="upload-progress-fill" style={{width: `${uploadProgress}%`}} />
-                  </div>
-                )}
-                <input type="file" accept=".pdf" style={{display:"none"}} onChange={handleUpload} disabled={uploading} />
+                <div className="upload-card-title">{uploading ? "Processing PDF..." : "Drop or Select PDF"}</div>
+                <div className="upload-card-subtitle">{uploading ? "This may take 1-3 minutes" : `Will tag as · ${resourceType.toUpperCase()}`}</div>
+                {uploading && uploadStage && <div className="upload-stage-label">{uploadStage}</div>}
+                {uploading && <div className="upload-shimmer"><div className="upload-shimmer-bar"/></div>}
+                <input type="file" accept=".pdf" style={{display:"none"}} onChange={handleUpload} disabled={uploading}/>
               </label>
-              {uploadMsg && <div className={`upload-status-message ${uploadOk ? "success" : "error"}`}>{uploadMsg}</div>}
+              {uploadMsg && !uploading && <div className={`upload-status-message ${uploadOk ? "success" : "error"}`}>{uploadMsg}</div>}
             </div>
 
             {(activeFile || subject.trim()) && (
@@ -519,13 +468,13 @@ export default function App() {
                   Active Context
                 </div>
                 <div className="active-context-card">
-                  <div className="active-context-glow" />
+                  <div className="active-context-glow"/>
                   <svg className="active-context-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
                   <div className="active-context-info">
                     <div className="active-context-title" title={activeFile || `${subject} Context`}>{activeFile || `${subject} Knowledge Index`}</div>
                     <div className="active-context-badge-row">
                       {subject.trim() && <span className="active-context-badge">{subject}</span>}
-                      <span className="active-context-status-dot" />
+                      <span className="active-context-status-dot"/>
                       <span className="active-context-status-text">Active Doc</span>
                     </div>
                   </div>
@@ -553,7 +502,7 @@ export default function App() {
               {messages.length === 0 ? (
                 <div className="empty-workspace">
                   <div className="empty-brand-sphere">
-                    <div className="empty-sphere-bg" />
+                    <div className="empty-sphere-bg"/>
                     <svg className="empty-logo-prism" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                       <path d="M12 2L2 7L12 12L22 7L12 2Z"/><path d="M2 17L12 22L22 17"/><path d="M2 12L12 17L22 12"/>
                     </svg>
@@ -593,37 +542,27 @@ export default function App() {
                         </div>
                       </div>
                     )}
-
                     <div className={`bubble ${msg.role}`}>
                       {msg.role === "assistant" && (
                         <button type="button" className="copy-btn" onClick={() => copyToClipboard(msg.content, i)}>
                           {copiedIndex === i ? "Copied!" : "Copy"}
                         </button>
                       )}
-
                       {msg.role === "assistant" ? (
-                        <div className="md-body" style={{paddingRight: "52px"}}>
+                        <div className="md-body" style={{paddingRight:"52px"}}>
                           <ReactMarkdown>{msg.content}</ReactMarkdown>
                         </div>
                       ) : (
                         <div>{msg.content}</div>
                       )}
-                      
                       {msg.isRetryable && (
-                        <div style={{marginTop: "12px", display: "flex", gap: "8px"}}>
-                          <button 
-                            className="retry-btn" 
-                            onClick={handleRetry}
-                            disabled={loading}
-                          >
+                        <div style={{marginTop:"12px",display:"flex",gap:"8px"}}>
+                          <button className="retry-btn" onClick={handleRetry} disabled={loading}>
                             {loading ? "Retrying..." : "Retry"}
                           </button>
-                          <span style={{fontSize: "11px", color: "var(--text-muted)", alignSelf: "center"}}>
-                            Gemini is temporarily unavailable
-                          </span>
+                          <span style={{fontSize:"11px",color:"var(--text-muted)",alignSelf:"center"}}>Gemini temporarily unavailable</span>
                         </div>
                       )}
-
                       {msg.sources?.length > 0 && (
                         <div className="sources-pane">
                           <div className="sources-headline">
@@ -644,9 +583,8 @@ export default function App() {
                         </div>
                       )}
                     </div>
-
                     {msg.role === "user" && (
-                      <div className="msg-avatar-wrapper" style={{marginRight:0, marginLeft:14}}>
+                      <div className="msg-avatar-wrapper" style={{marginRight:0,marginLeft:14}}>
                         <div className="msg-avatar">
                           <svg className="msg-avatar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
                         </div>
@@ -655,7 +593,6 @@ export default function App() {
                   </div>
                 ))
               )}
-
               {loading && (
                 <div className="msg-row assistant">
                   <div className="msg-avatar-wrapper">
@@ -670,7 +607,7 @@ export default function App() {
                   </div>
                 </div>
               )}
-              <div ref={bottomRef} />
+              <div ref={bottomRef}/>
             </div>
 
             <div className="input-deck">
@@ -682,13 +619,9 @@ export default function App() {
               )}
               <div className="input-glass-bar">
                 <div className="input-flex-row">
-                  <textarea
-                    ref={textareaRef}
-                    rows={1} className="chat-textarea"
+                  <textarea ref={textareaRef} rows={1} className="chat-textarea"
                     placeholder={subject ? `Ask about ${subject} (${resourceType})...` : "Select a subject and ask a question..."}
-                    value={question}
-                    onChange={e => setQuestion(e.target.value)}
-                    onKeyDown={handleKeyDown}
+                    value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={handleKeyDown}
                   />
                   <button className="action-send-btn" onClick={handleSend} disabled={loading || !question.trim()}>
                     <svg className="send-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
